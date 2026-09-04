@@ -431,10 +431,6 @@ impl ProfileRequirement {
             | Self::RealtimeWebsocket => false,
         }
     }
-
-    pub(super) const fn requires_voice_owner(&self) -> bool {
-        self.has_named_voice()
-    }
 }
 
 impl ServiceProfile {

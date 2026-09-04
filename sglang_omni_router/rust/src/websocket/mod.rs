@@ -788,14 +788,13 @@ fn classify_speech(bytes: &[u8], trust: &TrustDomain) -> Result<RouteRequirement
         Some(model) if !model.is_empty() => ModelSelection::Explicit(model),
         Some(_) | None => ModelSelection::UnresolvedDefault,
     };
-    speech_requirement(fields, model, trust, pool.voice_state_enabled())
+    speech_requirement(fields, model, trust)
 }
 
 fn speech_requirement(
     fields: SpeechFields,
     model: ModelSelection,
     trust: &TrustDomain,
-    _voice_state_enabled: bool,
 ) -> Result<RouteRequirement, ()> {
     let mut format = classify_response_format(
         fields
@@ -1217,7 +1216,6 @@ mod tests {
             fields,
             ModelSelection::Explicit(String::from("tts")),
             &TrustDomain::new(String::from("local")),
-            true,
         )
         .expect("valid speech requirement");
         let ProfileRequirement::SpeechWebsocket {
@@ -1257,7 +1255,6 @@ mod tests {
             encoded_stream,
             ModelSelection::Explicit(String::from("tts")),
             &TrustDomain::new(String::from("local")),
-            true,
         )
         .expect("worker owns unsupported response validation");
         let ProfileRequirement::SpeechWebsocket {
@@ -1309,7 +1306,6 @@ mod tests {
             unknown,
             ModelSelection::Explicit(String::from("tts")),
             &TrustDomain::new(String::from("local")),
-            true,
         )
         .expect("worker owns unknown enum validation");
         let ProfileRequirement::SpeechWebsocket {
@@ -1333,7 +1329,6 @@ mod tests {
             fields,
             ModelSelection::Explicit(String::from("tts")),
             &TrustDomain::new(String::from("local")),
-            true,
         )
         .expect("valid speech requirement");
         let ProfileRequirement::SpeechWebsocket {
@@ -1354,7 +1349,6 @@ mod tests {
             fields,
             ModelSelection::Explicit(String::from("tts")),
             &TrustDomain::new(String::from("local")),
-            true,
         )
         .expect("valid speech requirement");
         let ProfileRequirement::SpeechWebsocket {
