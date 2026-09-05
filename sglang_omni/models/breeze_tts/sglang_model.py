@@ -115,6 +115,7 @@ class BreezeForConditionalGeneration(nn.Module):
         self._decode_ready = False
         self._timing: dict = {}
         self._t_start = 0.0
+        self._captured_logged = False
 
     # ------------------------------------------------------------------ setup
     def setup_breeze_decode(self, *, depth_decoder: Any, max_batch_size: int, device: str) -> None:
@@ -165,7 +166,8 @@ class BreezeForConditionalGeneration(nn.Module):
     # ---------------------------------------------------------------- forward
     def forward(self, input_ids: Tensor, positions: Tensor, forward_batch: ForwardBatch,
                 input_embeds: Optional[Tensor] = None) -> LogitsProcessorOutput:
-        if _DEBUG_TIMING:
+        timing = _DEBUG_TIMING and not torch.cuda.is_current_stream_capturing()
+        if timing:
             torch.cuda.synchronize()
             self._t_start = __import__("time").perf_counter()
         if input_embeds is None and forward_batch.input_embeds is not None:
@@ -201,11 +203,11 @@ class BreezeForConditionalGeneration(nn.Module):
         # padded rows (2052 → 2112) are dropped so SGLang sees exactly codebook_size + 1 classes.
         logits = torch.nn.functional.linear(hidden_states, self.lm_head.weight)[:, : self.codebook_size + 1]
         if self._decode_ready:
-            if _DEBUG_TIMING:
+            if timing:
                 torch.cuda.synchronize()
                 t_mid = __import__("time").perf_counter()
             self._decode_codebooks(logits, hidden_states)
-            if _DEBUG_TIMING:
+            if timing:
                 torch.cuda.synchronize()
                 t_end = __import__("time").perf_counter()
                 self._timing_log(forward_batch, int(logits.shape[0]), t_mid - self._t_start, t_end - t_mid)
@@ -248,7 +250,7 @@ class BreezeForConditionalGeneration(nn.Module):
         valid = self._rep_positions.unsqueeze(0) < count.unsqueeze(1)
         lg.scatter_(-1, prev, torch.where(valid, penalized, scores))
         token = self._sample(lg, self._temperature[:bs], self._top_k[:bs])            # cb0 or EOS
-        if _DEBUG_STEPS:
+        if _DEBUG_STEPS and not torch.cuda.is_current_stream_capturing():
             raw = logits[0, : self.codebook_size + 1].float()
             top = torch.topk(raw, 5)
             logger.info("breeze step row0 n=%d top5=%s eos_logit=%.2f chosen=%d",
@@ -259,9 +261,14 @@ class BreezeForConditionalGeneration(nn.Module):
         # depth decoder: [dummy, cb0, .., cb_{k-1}] → codebook k at the last position (one CUDA
         # graph replay per frame when captured; the eager loop otherwise)
         depth_hidden = hidden_states.to(self.depth_decoder.dtype if hasattr(self.depth_decoder, "dtype") else torch.bfloat16)
-        if self._depth_graph is not None:
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not self._captured_logged:
+            self._captured_logged = True
+            logger.info("breeze: codebook sampling + depth-decoder loop are being captured inside SGLang's decode graph (bs=%d)", bs)
+        if self._depth_graph is not None and not capturing:
             frame = self._depth_graph.run(depth_hidden, cb0, self._depth_temperature[:bs], self._depth_top_k[:bs])
         else:
+            # eager loop: also what SGLang's CUDA-graph capture records (a graph cannot replay inside a capture)
             seq = torch.cat([torch.zeros(bs, 1, dtype=torch.long, device=logits.device), cb0.unsqueeze(1)], dim=1)
             for _ in range(1, self.num_codebooks):
                 out = self.depth_decoder(input_ids=seq, backbone_last_hidden_state=depth_hidden, use_cache=False,

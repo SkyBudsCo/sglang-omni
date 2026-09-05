@@ -29,13 +29,17 @@ class BreezeEngineBuilder(TtsEngineBuilder):
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         del dtype
+        max_bs = int(os.environ.get("BREEZE_SGL_MAX_BS", "32"))
         return {
-            "max_running_requests": 32,
-            "disable_cuda_graph": True,            # M4
+            "max_running_requests": max_bs,
+            # SGLang captures the decode step per batch bucket; the codebook sampling and the
+            # depth-decoder loop run inside that capture (sglang_model._decode_codebooks).
+            "disable_cuda_graph": bool(os.environ.get("BREEZE_SGL_NO_GRAPH")),
+            "cuda_graph_max_bs": max_bs,
             "mem_fraction_static": float(os.environ.get("BREEZE_SGL_MEM_FRACTION", "0.35")),
             "chunked_prefill_size": 4096,
             "dtype": "bfloat16",
-            "enable_torch_compile": False,         # M4
+            "enable_torch_compile": False,
             "random_seed": int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF,
         }
 

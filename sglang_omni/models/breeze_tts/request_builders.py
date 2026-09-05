@@ -27,7 +27,8 @@ class BreezeSGLangRequestData(SGLangARRequestData):
     # Frames the model has produced so far, [num_codebooks] each (CPU) —
     # appended by the model runner, drained by the stream output builder.
     output_codes: list[torch.Tensor] = field(default_factory=list)
-    last_frame: torch.Tensor | None = None          # GPU copy of the newest frame: the next step's input
+    last_frame: torch.Tensor | None = None          # device view of the newest frame: the next step's input
+    pending_frame: torch.Tensor | None = None       # newest frame not yet copied to output_codes (device)
     cb0_history: list[int] = field(default_factory=list)   # for the repetition penalty
     depth_temperature: float = 0.9
     depth_top_k: int = 50
@@ -91,6 +92,13 @@ def build_sglang_tts_request(
 
 
 def apply_tts_result(state: BreezeState, result: BreezeSGLangRequestData) -> None:
+    # the runner copies frames to the host one step late; a request that just finished
+    # may still hold its last frame on the device (an EOS step stages no frame)
+    if result.pending_frame is not None:
+        last_token = result.req.output_ids[-1] if getattr(result.req, "output_ids", None) else None
+        if last_token != result.backbone_eos_token_id:
+            result.output_codes.append(result.pending_frame.cpu())
+        result.pending_frame = None
     if not result.output_codes:
         raise ValueError(f"Request {result.req.rid}: Breeze generated no audio frames")
     state.output_codes = torch.stack(result.output_codes, dim=0)   # [T, num_codebooks]

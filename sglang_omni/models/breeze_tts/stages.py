@@ -205,6 +205,8 @@ def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, 
                                         instruction=inputs.get("instruction"),
                                         speaker=inputs.get("speaker", "S0"),
                                         request_id=payload.request_id)
+        # One prompt at a time on the GPU: without the lock a burst of prompts contends with the
+        # engine's decode steps and everything slows (merge 0.4 s → 3 s, engine step +50%).
         with lock, (torch.cuda.stream(stream) if stream is not None else __import__("contextlib").nullcontext()):
             t1 = time.perf_counter()
             inputs_t = adapter.prepare_inputs(request)                      # reference codes + token ids
@@ -269,14 +271,16 @@ class BreezeVocoderScheduler(StreamingSimpleScheduler):
         return self._vocode_payloads([payload])[0]
 
     def _vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        import time
+        states = [self._validate(p) for p in payloads]
+        t0 = time.perf_counter()
+        # one batched decode for the whole group (the tokenizer pads internally)
+        wavs, sample_rate = self._audio_tokenizer.decode([{"audio_codes": s.output_codes.to(torch.long)} for s in states])
+        vocode_s = (time.perf_counter() - t0) / max(len(states), 1)
         out: list[StagePayload] = []
-        for payload in payloads:
-            import time
-            state = self._validate(payload)
-            t0 = time.perf_counter()
-            audio, sample_rate = decode_frames(self._audio_tokenizer, state.output_codes)   # float32 [samples], CPU
-            state.sample_rate = sample_rate
-            vocode_s = time.perf_counter() - t0
+        for payload, state, wav in zip(payloads, states, wavs):
+            audio = torch.as_tensor(wav, dtype=torch.float32).reshape(-1).cpu()
+            state.sample_rate = int(sample_rate)
             frames = int(state.output_codes.shape[0])
             eng = state.engine_time_s or 0.0
             logger.info("breeze timing %s: %d frames → %.2f s (%s) | preprocess %.2fs (encode %.2f, merge %.2f) | engine %.2fs = %.0f ms/frame | vocode %.2fs",

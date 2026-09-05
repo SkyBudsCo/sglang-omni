@@ -22,7 +22,7 @@ CAPABILITIES = ModelCapabilities(
     supports_reference_audio=True,
     supports_batch_vocoder=True,
     supports_streaming_vocoder=False,    # M3: per-frame Mimi streaming decode
-    supports_cuda_graph=False,           # M4
+    supports_cuda_graph=True,           # M4
     supports_torch_compile=False,        # M4
     supports_breakable_prefill_cuda_graph=False,
 )
