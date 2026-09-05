@@ -129,6 +129,41 @@ def _reference_from_payload(ref: dict[str, Any], scratch_dir: str) -> BreezeRefe
     return None
 
 
+def _install_reference_code_cache(adapter: BreezePromptAdapter, max_items: int = 64) -> None:
+    """Reference wav → codes is ~0.7 s per request on the audio tokenizer and
+    the same few voices come back all day: memoize breeze_infer.templates'
+    encoder by path (+ mtime/size), like S2's ReferenceEncodeService."""
+    import collections
+    import threading
+    templates = adapter._templates
+    original = templates._encode_prompt_audio
+    if getattr(original, "_breeze_cached", False):
+        return
+    cache: "collections.OrderedDict[tuple, torch.Tensor]" = collections.OrderedDict()
+    guard = threading.Lock()
+
+    def cached(audio_tokenizer: Any, audio_path: Any) -> torch.Tensor:
+        try:
+            st = os.stat(audio_path)
+            key = (str(audio_path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return original(audio_tokenizer, audio_path)
+        with guard:
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+        codes = original(audio_tokenizer, audio_path)
+        with guard:
+            cache[key] = codes
+            while len(cache) > max_items:
+                cache.popitem(last=False)
+        return codes
+
+    cached._breeze_cached = True
+    templates._encode_prompt_audio = cached
+
+
 def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, device: str = "cuda:0"):
     """Threaded preprocessing on one GPU copy of the model's encoders."""
     import tempfile
@@ -136,10 +171,16 @@ def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, 
     checkpoint_dir = _resolve_checkpoint(model_path)
     model = load_breeze_model(checkpoint_dir, device)
     adapter = BreezePromptAdapter(checkpoint_dir, model, device)
+    _install_reference_code_cache(adapter)
     scratch_dir = tempfile.mkdtemp(prefix="breeze-refs-")
     lock = __import__("threading").Lock()          # one GPU model, many workers
+    # The engine shares this GPU and keeps it busy with back-to-back graph replays; a
+    # high-priority stream lets a prompt's text-encoder work interleave instead of queueing.
+    stream = torch.cuda.Stream(device=device, priority=-1) if device.startswith("cuda") else None
 
     def _preprocess(payload: StagePayload) -> StagePayload:
+        import time
+        t0 = time.perf_counter()
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
         if isinstance(inputs, str):
@@ -150,17 +191,30 @@ def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, 
                                         instruction=inputs.get("instruction"),
                                         speaker=inputs.get("speaker", "S0"),
                                         request_id=payload.request_id)
-        with lock:
-            embeds = build_prompt_embeds(model, adapter, request, device).to(torch.bfloat16).cpu()
+        with lock, (torch.cuda.stream(stream) if stream is not None else __import__("contextlib").nullcontext()):
+            t1 = time.perf_counter()
+            inputs_t = adapter.prepare_inputs(request)                      # reference codes + token ids
+            t2 = time.perf_counter()
+            merged = model._merge_input_ids_with_input_values(
+                input_ids=inputs_t["input_ids"], input_values=inputs_t.get("input_values"),
+                text_ids_mask=inputs_t["text_ids_mask"], text_ids_len=inputs_t["text_ids_len"],
+                attention_mask=inputs_t.get("attention_mask"))
+            embeds = merged_embeds(merged)[0].to(torch.bfloat16).cpu()
+            if stream is not None:
+                stream.synchronize()
+            t3 = time.perf_counter()
         state = BreezeState(
             prefill_embeds=embeds,
             prompt_len=int(embeds.shape[0]),
             max_new_tokens=int(params.get("max_new_tokens", 1024)),
-            temperature=float(params.get("temperature", 0.8)),
-            top_p=float(params.get("top_p", 0.95)),
+            temperature=float(params.get("temperature", 0.9)),
+            top_p=float(params.get("top_p", 1.0)),
             top_k=int(params.get("top_k", 50)),
-            repetition_penalty=float(params.get("repetition_penalty", 1.0)),
+            repetition_penalty=float(params.get("repetition_penalty", 1.1)),
             seed=params.get("seed"),
+            preprocess_encode_s=t2 - t1,
+            preprocess_merge_s=t3 - t2,
+            preprocess_time_s=time.perf_counter() - t0,
         )
         return store_state(payload, state)
 
@@ -203,11 +257,17 @@ class BreezeVocoderScheduler(StreamingSimpleScheduler):
     def _vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
         out: list[StagePayload] = []
         for payload in payloads:
+            import time
             state = self._validate(payload)
+            t0 = time.perf_counter()
             audio = decode_frames(self._model, state.output_codes)          # float32 [samples], CPU
+            vocode_s = time.perf_counter() - t0
             frames = int(state.output_codes.shape[0])
-            logger.info("breeze vocoder %s: %d frames → %.2f s (%s)", payload.request_id, frames,
-                        audio.shape[-1] / state.sample_rate, state.finish_reason)
+            eng = state.engine_time_s or 0.0
+            logger.info("breeze timing %s: %d frames → %.2f s (%s) | preprocess %.2fs (encode %.2f, merge %.2f) | engine %.2fs = %.0f ms/frame | vocode %.2fs",
+                        payload.request_id, frames, audio.shape[-1] / state.sample_rate, state.finish_reason,
+                        state.preprocess_time_s or 0.0, state.preprocess_encode_s or 0.0, state.preprocess_merge_s or 0.0,
+                        eng, 1000.0 * eng / max(frames, 1), vocode_s)
             state.audio_samples = audio
             done = store_state(payload, state)
             # what the client reads off the terminal payload (same keys the S2 vocoder emits;

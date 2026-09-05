@@ -37,5 +37,11 @@ class BreezeState(DeclarativeStateBase):
     output_codes: Any | None = wire(None, codec="tensor_restore")   # [T_frames, num_codebooks]
     finish_reason: str | None = None
 
+    # -- Timing (seconds) --------------------------------------------------
+    preprocess_time_s: float | None = None
+    preprocess_encode_s: float | None = None       # reference audio → codes
+    preprocess_merge_s: float | None = None        # text encoder + merge
+    engine_time_s: float | None = None
+
     # -- From vocoder ------------------------------------------------------
     audio_samples: Any | None = wire(None, codec="tensor_list")

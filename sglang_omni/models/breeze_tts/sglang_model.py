@@ -42,8 +42,10 @@ from sglang_omni.vendor.sglang.utils import make_layers
 logger = logging.getLogger(__name__)
 
 REP_HISTORY_LEN = 64          # codebook-0 tokens the repetition penalty looks back over
+GRAPH_TOP_K = 64              # fixed top-k width (the reference samples with top_k=50)
 _NEG_INF = -float("inf")
-_DEBUG_STEPS = bool(__import__("os").environ.get("BREEZE_DEBUG_STEPS"))   # log row-0 logits per step
+_DEBUG_STEPS = bool(__import__("os").environ.get("BREEZE_DEBUG_STEPS"))     # log row-0 logits per step
+_DEBUG_TIMING = bool(__import__("os").environ.get("BREEZE_DEBUG_TIMING"))   # backbone vs depth-decoder ms per step
 
 
 def _cfg(obj: Any, key: str, default: Any = None) -> Any:
@@ -111,6 +113,8 @@ class BreezeForConditionalGeneration(nn.Module):
         # decode state (setup_breeze_decode)
         self.depth_decoder: Any = None
         self._decode_ready = False
+        self._timing: dict = {}
+        self._t_start = 0.0
 
     # ------------------------------------------------------------------ setup
     def setup_breeze_decode(self, *, depth_decoder: Any, max_batch_size: int, device: str) -> None:
@@ -134,6 +138,17 @@ class BreezeForConditionalGeneration(nn.Module):
         bias[self.codec_codebook_size:self.codebook_size] = _NEG_INF
         self._backbone_bias = bias
         self._depth_bias = bias[: self.codebook_size].clone()
+        self._depth_graph = None
+        if not __import__("os").environ.get("BREEZE_DEPTH_EAGER"):
+            from .depth_graph import DepthDecoderGraph
+            try:
+                graph = DepthDecoderGraph(self.depth_decoder, num_codebooks=self.num_codebooks,
+                                          hidden_size=self.hidden_size, sample_fn=self._sample,
+                                          depth_bias=self._depth_bias, device=dev, max_batch_size=n)
+                graph.capture()
+                self._depth_graph = graph
+            except Exception:
+                logger.exception("breeze depth decoder: CUDA graph capture failed; staying eager")
         self._decode_ready = True
 
     @property
@@ -150,6 +165,9 @@ class BreezeForConditionalGeneration(nn.Module):
     # ---------------------------------------------------------------- forward
     def forward(self, input_ids: Tensor, positions: Tensor, forward_batch: ForwardBatch,
                 input_embeds: Optional[Tensor] = None) -> LogitsProcessorOutput:
+        if _DEBUG_TIMING:
+            torch.cuda.synchronize()
+            self._t_start = __import__("time").perf_counter()
         if input_embeds is None and forward_batch.input_embeds is not None:
             input_embeds = forward_batch.input_embeds
         if input_embeds is not None:
@@ -183,24 +201,39 @@ class BreezeForConditionalGeneration(nn.Module):
         # padded rows (2052 → 2112) are dropped so SGLang sees exactly codebook_size + 1 classes.
         logits = torch.nn.functional.linear(hidden_states, self.lm_head.weight)[:, : self.codebook_size + 1]
         if self._decode_ready:
+            if _DEBUG_TIMING:
+                torch.cuda.synchronize()
+                t_mid = __import__("time").perf_counter()
             self._decode_codebooks(logits, hidden_states)
+            if _DEBUG_TIMING:
+                torch.cuda.synchronize()
+                t_end = __import__("time").perf_counter()
+                self._timing_log(forward_batch, int(logits.shape[0]), t_mid - self._t_start, t_end - t_mid)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden_states)
+
+    def _timing_log(self, forward_batch: ForwardBatch, bs: int, backbone_s: float, depth_s: float) -> None:
+        mode = "extend" if forward_batch.forward_mode.is_extend() else "decode"
+        acc = self._timing.setdefault((mode, bs), [0, 0.0, 0.0])
+        acc[0] += 1
+        acc[1] += backbone_s
+        acc[2] += depth_s
+        if acc[0] % 25 == 0:
+            logger.info("breeze timing %s bs=%d n=%d: backbone %.1f ms, depth decoder %.1f ms (per step)",
+                        mode, bs, acc[0], 1000 * acc[1] / acc[0], 1000 * acc[2] / acc[0])
 
     # --------------------------------------------------------------- sampling
     def _sample(self, logits: Tensor, temperature: Tensor, top_k: Tensor) -> Tensor:
-        """Per-row temperature + top-k sampling on float logits [bs, V]."""
-        k_max = int(top_k.max().item()) if top_k.numel() else 0
-        if k_max > 0:
-            k_max = min(k_max, logits.shape[-1])
-            topk_vals, topk_idx = torch.topk(logits, k_max, dim=-1)
-            pos = torch.arange(k_max, device=logits.device).unsqueeze(0)
-            k_eff = torch.where(top_k > 0, top_k.clamp(max=k_max), torch.full_like(top_k, k_max))
-            topk_vals = topk_vals.masked_fill(pos >= k_eff.unsqueeze(1), _NEG_INF)
-            probs = torch.softmax(topk_vals / temperature.clamp(min=1e-5).unsqueeze(1), dim=-1)
-            choice = torch.multinomial(probs, 1)
-            return topk_idx.gather(-1, choice).squeeze(-1)
-        probs = torch.softmax(logits / temperature.clamp(min=1e-5).unsqueeze(1), dim=-1)
-        return torch.multinomial(probs, 1).squeeze(-1)
+        """Per-row temperature + top-k sampling on float logits [bs, V]. A fixed
+        top-k width keeps it CUDA-graph safe (no host syncs); per-row top_k is a
+        mask inside that width, top_k <= 0 means the full width."""
+        k_max = min(GRAPH_TOP_K, logits.shape[-1])
+        topk_vals, topk_idx = torch.topk(logits, k_max, dim=-1)
+        pos = torch.arange(k_max, device=logits.device).unsqueeze(0)
+        k_eff = torch.where(top_k > 0, top_k.clamp(max=k_max), torch.full_like(top_k, k_max))
+        topk_vals = topk_vals.masked_fill(pos >= k_eff.unsqueeze(1), _NEG_INF)
+        probs = torch.softmax(topk_vals / temperature.clamp(min=1e-5).unsqueeze(1), dim=-1)
+        choice = torch.multinomial(probs, 1)
+        return topk_idx.gather(-1, choice).squeeze(-1)
 
     @torch.no_grad()
     def _decode_codebooks(self, logits: Tensor, hidden_states: Tensor) -> None:
@@ -223,16 +256,20 @@ class BreezeForConditionalGeneration(nn.Module):
                         float(raw[self.eos_token_id]), int(token[0]))
         is_eos = token == self.eos_token_id
         cb0 = torch.where(is_eos, torch.zeros_like(token), token)
-        # depth decoder: [dummy, cb0, .., cb_{k-1}] → codebook k at the last position
-        seq = torch.cat([torch.zeros(bs, 1, dtype=torch.long, device=logits.device), cb0.unsqueeze(1)], dim=1)
+        # depth decoder: [dummy, cb0, .., cb_{k-1}] → codebook k at the last position (one CUDA
+        # graph replay per frame when captured; the eager loop otherwise)
         depth_hidden = hidden_states.to(self.depth_decoder.dtype if hasattr(self.depth_decoder, "dtype") else torch.bfloat16)
-        for _ in range(1, self.num_codebooks):
-            out = self.depth_decoder(input_ids=seq, backbone_last_hidden_state=depth_hidden,
-                                     use_cache=False, return_dict=True)
-            step_logits = out.logits[:, -1, :].float() + self._depth_bias
-            tok = self._sample(step_logits, self._depth_temperature[:bs], self._depth_top_k[:bs])
-            seq = torch.cat([seq, tok.unsqueeze(1)], dim=1)
-        frame = seq[:, 1:]
+        if self._depth_graph is not None:
+            frame = self._depth_graph.run(depth_hidden, cb0, self._depth_temperature[:bs], self._depth_top_k[:bs])
+        else:
+            seq = torch.cat([torch.zeros(bs, 1, dtype=torch.long, device=logits.device), cb0.unsqueeze(1)], dim=1)
+            for _ in range(1, self.num_codebooks):
+                out = self.depth_decoder(input_ids=seq, backbone_last_hidden_state=depth_hidden, use_cache=False,
+                                         cache_position=torch.arange(seq.shape[1], device=seq.device), return_dict=True)
+                step_logits = out.logits[:, -1, :].float() + self._depth_bias
+                tok = self._sample(step_logits, self._depth_temperature[:bs], self._depth_top_k[:bs])
+                seq = torch.cat([seq, tok.unsqueeze(1)], dim=1)
+            frame = seq[:, 1:]
         self._out_frame[:bs] = frame
         self._out_token[:bs] = token
         self._last_frame[:bs] = frame
