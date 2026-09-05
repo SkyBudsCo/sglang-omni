@@ -112,6 +112,13 @@ class ModelWorker:
 
             register_dots_tts_hf_config()
 
+        if self.model_arch_override == "BreezeForConditionalGeneration":
+            from sglang_omni.models.breeze_tts.hf_config import (
+                register_breeze_hf_config,
+            )
+
+            register_breeze_hf_config()
+
         from sglang.srt.configs.model_config import ModelConfig
 
         self.model_config = ModelConfig.from_server_args(
