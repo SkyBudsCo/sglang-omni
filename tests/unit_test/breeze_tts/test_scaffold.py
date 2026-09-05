@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """M1 tests for the Breeze TTS 2 plugin: the pipeline is discoverable and the
 preprocessing / vocoder stages agree with the reference runtime bit for bit.
-GPU tests need the checkpoint (BREEZE_TTS_MODEL) and the breeze-tts checkout
-(BREEZE_TTS_SRC); they skip otherwise."""
+The stage tests need the checkpoint (BREEZE_TTS_MODEL) and the breeze-tts
+checkout (BREEZE_TTS_SRC); they skip otherwise. BREEZE_TEST_DEVICE=cpu runs
+them on a box whose GPU is busy serving."""
 
 import os
 
@@ -10,8 +11,8 @@ import pytest
 import torch
 
 MODEL = os.environ.get("BREEZE_TTS_MODEL", "/workspace/models/breeze-tts-2")
-gpu = pytest.mark.skipif(not (torch.cuda.is_available() and os.path.isdir(MODEL)),
-                         reason="needs a GPU and the Breeze checkpoint")
+DEVICE = os.environ.get("BREEZE_TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+needs_checkpoint = pytest.mark.skipif(not os.path.isdir(MODEL), reason="needs the Breeze checkpoint")
 
 
 def test_pipeline_config_is_registered():
@@ -43,33 +44,37 @@ def test_request_builder_hands_sglang_the_embeds():
     assert len(rd.req.origin_input_ids) == 5
 
 
-@gpu
+@needs_checkpoint
 def test_prompt_embeds_match_the_reference_runtime():
     """preprocessing's merged prompt == breeze-tts's _merge_input_ids_with_input_values."""
     from sglang_omni.models.breeze_tts.stages import load_breeze_model, build_prompt_embeds
     from sglang_omni.models.breeze_tts.tokenizer import BreezePromptAdapter, BreezeReference
-    import torchaudio
-    model = load_breeze_model(MODEL, "cuda")
-    adapter = BreezePromptAdapter(MODEL)
+    model = load_breeze_model(MODEL, DEVICE)
+    adapter = BreezePromptAdapter(MODEL, model, DEVICE)
     ref_dir = os.environ.get("BREEZE_TEST_REF", "/workspace/self-hosted/services/tts/references/ash-final")
-    wav, sr = torchaudio.load(os.path.join(ref_dir, "sample.wav"))
-    ref = BreezeReference(audio=wav.mean(0), sample_rate=sr, text=open(os.path.join(ref_dir, "sample.lab")).read().strip())
+    ref = BreezeReference(audio_path=os.path.join(ref_dir, "sample.wav"),
+                          text=open(os.path.join(ref_dir, "sample.lab")).read().strip())
     req = adapter.build_request(text="Hi there, it's me.", reference=ref)
-    embeds = build_prompt_embeds(model, adapter, req, "cuda")
+    assert req.template == "ref_edit_tata"
+    embeds = build_prompt_embeds(model, adapter, req, DEVICE)
     assert embeds.ndim == 2 and embeds.shape[1] == model.config.hidden_size
-    # the reference path, called directly
-    inputs = adapter.prepare_inputs(req, codec=model.codec_model, device="cuda")
-    ref_embeds = model._merge_input_ids_with_input_values(
+    # the reference runtime's own path, called directly (breeze_infer.templates + the model's merge)
+    from breeze_infer.templates import get_template, prepare_inputs
+    inputs = prepare_inputs(adapter.tokenizer, adapter.audio_tokenizer, model, [req.request],
+                            get_template(req.template), guidance_scale=1.0,
+                            guidance_scale_ref=None, guidance_scale_ins=None)
+    from sglang_omni.models.breeze_tts.stages import merged_embeds
+    ref_embeds = merged_embeds(model._merge_input_ids_with_input_values(
         input_ids=inputs["input_ids"], input_values=inputs.get("input_values"),
         text_ids_mask=inputs["text_ids_mask"], text_ids_len=inputs["text_ids_len"],
-        attention_mask=inputs["attention_mask"])["inputs_embeds"][0]
+        attention_mask=inputs.get("attention_mask")))[0]
     assert torch.equal(embeds.to(ref_embeds.dtype), ref_embeds)
 
 
-@gpu
+@needs_checkpoint
 def test_vocoder_decodes_frames_like_the_codec():
     from sglang_omni.models.breeze_tts.stages import load_breeze_model, decode_frames
-    model = load_breeze_model(MODEL, "cuda")
-    frames = torch.randint(0, 2048, (25, 16), device="cuda")        # 2 s of 12.5 Hz frames
+    model = load_breeze_model(MODEL, DEVICE)
+    frames = torch.randint(0, 2048, (25, 16), device=DEVICE)        # 2 s of 12.5 Hz frames
     audio = decode_frames(model, frames)
     assert audio.ndim == 1 and 24000 * 1.8 < audio.numel() < 24000 * 2.2

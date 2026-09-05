@@ -28,8 +28,47 @@ def load_breeze_model(checkpoint_dir: str, device: str):
     only the pieces each stage needs."""
     breeze_src()
     from models.breeze import BreezeForConditionalGeneration  # breeze-tts checkout
-    model = BreezeForConditionalGeneration.from_pretrained(checkpoint_dir, torch_dtype=torch.bfloat16)
-    return model.to(device).eval()
+    from models.breeze_config import BreezeConfig
+    import json
+    from safetensors.torch import load_file
+    from transformers.initialization import no_init_weights
+
+    # Built eagerly rather than through from_pretrained: transformers 5 constructs
+    # on the meta device and leaves this custom model's non-persistent buffers
+    # (codebook offsets, the text encoder's rotary inv_freq) uninitialized.
+    config = BreezeConfig.from_pretrained(checkpoint_dir)
+    with no_init_weights():
+        model = BreezeForConditionalGeneration(config)
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        shards = sorted(set(json.load(open(index_path))["weight_map"].values()))
+    else:
+        shards = ["model.safetensors"]
+    state: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        state.update(load_file(os.path.join(checkpoint_dir, shard)))
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    tied = {"backbone_model.embed_tokens.embed_audio_tokens.weight"}
+    if unexpected or (set(missing) - tied):
+        raise ValueError(f"breeze checkpoint mismatch: missing {sorted(set(missing) - tied)[:5]} unexpected {list(unexpected)[:5]}")
+    _tie_audio_embeddings(model)
+    return model.to(device=device, dtype=torch.bfloat16).eval()
+
+
+def _tie_audio_embeddings(model: Any) -> None:
+    """The checkpoint stores the audio-codebook table once (under the depth
+    decoder) and breeze-tts ties the backbone's copy to it in `_tie_weights`;
+    transformers 5's loader no longer honours that hook, leaving the backbone
+    table newly initialized — tie it here (weights are identical objects, as
+    the reference runtime has them under 4.57)."""
+    if not getattr(model.config, "tie_codebooks_embeddings", True):
+        return
+    backbone = model.backbone_model.embed_tokens.embed_audio_tokens
+    depth = model.depth_decoder.model.embed_tokens
+    if backbone.weight.data_ptr() != depth.weight.data_ptr():
+        if tuple(backbone.weight.shape) != tuple(depth.weight.shape):
+            raise ValueError(f"cannot tie audio embeddings: backbone {tuple(backbone.weight.shape)} vs depth decoder {tuple(depth.weight.shape)}")
+        backbone.weight = depth.weight
 
 
 def load_state(payload: StagePayload) -> BreezeState:
@@ -42,7 +81,7 @@ def build_prompt_embeds(model: Any, adapter: BreezePromptAdapter, request: dict[
     """[prompt_len, hidden] — the backbone's prompt exactly as breeze-tts
     builds it: text through the T5Gemma2 encoder + projection, reference audio
     through Mimi's encoder into per-frame codebook embeddings."""
-    inputs = adapter.prepare_inputs(request, codec=model.codec_model, device=device)
+    inputs = adapter.prepare_inputs(request)
     merged = model._merge_input_ids_with_input_values(
         input_ids=inputs["input_ids"],
         input_values=inputs.get("input_values"),
@@ -50,7 +89,14 @@ def build_prompt_embeds(model: Any, adapter: BreezePromptAdapter, request: dict[
         text_ids_len=inputs["text_ids_len"],
         attention_mask=inputs.get("attention_mask"),
     )
-    return merged["inputs_embeds"][0]
+    return merged_embeds(merged)[0]
+
+
+def merged_embeds(merged: Any) -> torch.Tensor:
+    """breeze-tts's merge returns a dict in some revisions and the tensor in others."""
+    if isinstance(merged, dict):
+        return merged["inputs_embeds"]
+    return merged
 
 
 @torch.no_grad()
@@ -62,27 +108,35 @@ def decode_frames(model: Any, frames: torch.Tensor) -> torch.Tensor:
     return audio.reshape(-1).float().cpu()
 
 
-def _reference_from_payload(ref: dict[str, Any]) -> BreezeReference | None:
-    """A reference given as a path, or as raw samples + rate (uploaded)."""
+def _reference_from_payload(ref: dict[str, Any], scratch_dir: str) -> BreezeReference | None:
+    """A reference given as a path, or as raw samples + rate (uploaded) which
+    are written to a wav — breeze-tts's audio tokenizer reads files."""
     text = ref.get("text", "")
     path = ref.get("audio_path")
     if path:
-        import torchaudio
-        wav, sr = torchaudio.load(path)
-        return BreezeReference(audio=wav.mean(0), sample_rate=int(sr), text=text)
+        return BreezeReference(audio_path=path, text=text)
     samples = ref.get("audio")
     if samples is not None:
-        wav = torch.as_tensor(samples, dtype=torch.float32)
-        return BreezeReference(audio=wav, sample_rate=int(ref.get("sample_rate", 24000)), text=text)
+        import hashlib
+        import soundfile as sf
+        wav = torch.as_tensor(samples, dtype=torch.float32).reshape(-1).numpy()
+        sr = int(ref.get("sample_rate", 24000))
+        digest = hashlib.sha1(wav.tobytes() + str(sr).encode()).hexdigest()[:16]
+        path = os.path.join(scratch_dir, f"ref-{digest}.wav")
+        if not os.path.exists(path):
+            sf.write(path, wav, sr)
+        return BreezeReference(audio_path=path, text=text)
     return None
 
 
 def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, device: str = "cuda:0"):
     """Threaded preprocessing on one GPU copy of the model's encoders."""
+    import tempfile
     from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
     checkpoint_dir = _resolve_checkpoint(model_path)
     model = load_breeze_model(checkpoint_dir, device)
-    adapter = BreezePromptAdapter(checkpoint_dir)
+    adapter = BreezePromptAdapter(checkpoint_dir, model, device)
+    scratch_dir = tempfile.mkdtemp(prefix="breeze-refs-")
     lock = __import__("threading").Lock()          # one GPU model, many workers
 
     def _preprocess(payload: StagePayload) -> StagePayload:
@@ -91,10 +145,11 @@ def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, 
         if isinstance(inputs, str):
             inputs = {"text": inputs}
         refs = inputs.get("references") or []
-        reference = _reference_from_payload(refs[0]) if refs else None
+        reference = _reference_from_payload(refs[0], scratch_dir) if refs else None
         request = adapter.build_request(text=inputs.get("text", ""), reference=reference,
                                         instruction=inputs.get("instruction"),
-                                        speaker=inputs.get("speaker", "S1"))
+                                        speaker=inputs.get("speaker", "S0"),
+                                        request_id=payload.request_id)
         with lock:
             embeds = build_prompt_embeds(model, adapter, request, device).to(torch.bfloat16).cpu()
         state = BreezeState(
