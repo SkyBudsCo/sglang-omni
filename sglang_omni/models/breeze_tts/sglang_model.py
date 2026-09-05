@@ -85,6 +85,18 @@ class BreezeForConditionalGeneration(nn.Module):
             ),
             prefix="layers",
         )
+        # The S2 attention builds its RoPE in Fish's interleaved (GPT-J) style; Breeze's backbone
+        # is HF Qwen3, which rotates the two halves (NeoX style). Same weights, different rotation.
+        from sglang.srt.layers.rotary_embedding import get_rope
+        head_dim = int(_cfg(bb, "head_dim", 128))
+        for layer in self.layers:
+            layer.self_attn.rotary_emb = get_rope(
+                head_dim,
+                rotary_dim=head_dim,
+                max_position=int(_cfg(bb, "max_position_embeddings", 40960)),
+                base=float(_cfg(bb, "rope_theta", 1000000.0)),
+                is_neox_style=True,
+            )
         from sglang.srt.layers.layernorm import RMSNorm
         self.norm = RMSNorm(self.hidden_size, eps=float(_cfg(bb, "rms_norm_eps", 1e-6)))
         self.start_layer, self.end_layer = 0, self.num_layers
