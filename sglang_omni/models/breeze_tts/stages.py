@@ -99,13 +99,27 @@ def merged_embeds(merged: Any) -> torch.Tensor:
     return merged
 
 
+def load_audio_tokenizer(checkpoint_dir: str, device: str):
+    """The bundled Qwen3-TTS 12.5 Hz audio tokenizer: it encodes references AND
+    decodes generated frames — the reference runtime never decodes through the
+    checkpoint's Mimi (that codec is the training-side encoder), so neither do we."""
+    breeze_src()
+    from qwen_tts import Qwen3TTSTokenizer
+    bundled = os.path.join(checkpoint_dir, "audio_tokenizer")
+    if not os.path.isdir(bundled):
+        raise FileNotFoundError(f"Breeze checkpoint has no audio_tokenizer/ at {bundled}")
+    return Qwen3TTSTokenizer.from_pretrained(bundled, device_map=device)
+
+
 @torch.no_grad()
-def decode_frames(model: Any, frames: torch.Tensor) -> torch.Tensor:
-    """[T, num_codebooks] Mimi codes → [samples] float32 at 24 kHz."""
-    codes = frames.to(model.codec_model.device).T.unsqueeze(0)      # [1, num_codebooks, T]
-    out = model.codec_model.decode(audio_codes=codes)
-    audio = out.audio_values if hasattr(out, "audio_values") else out[0]
-    return audio.reshape(-1).float().cpu()
+def decode_frames(audio_tokenizer: Any, frames: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """[T, num_codebooks] codes → ([samples] float32, sample_rate) through the
+    audio tokenizer's decoder, the way breeze-tts's server does it."""
+    codes = frames.to(torch.long)
+    wavs, sample_rate = audio_tokenizer.decode({"audio_codes": codes})
+    wav = wavs[0]
+    audio = torch.as_tensor(wav, dtype=torch.float32).reshape(-1).cpu()
+    return audio, int(sample_rate)
 
 
 def _reference_from_payload(ref: dict[str, Any], scratch_dir: str) -> BreezeReference | None:
@@ -230,11 +244,11 @@ def create_sglang_tts_engine_executor(model_path: str, *, device: str = "cuda", 
 
 
 class BreezeVocoderScheduler(StreamingSimpleScheduler):
-    """M1: whole-utterance Mimi decode, batched. Streaming per-frame decode
-    with overlap is M3 (the S2 streaming_vocoder is the template)."""
+    """M1: whole-utterance decode through the audio tokenizer, batched.
+    Streaming per-chunk decode is M3 (the S2 streaming_vocoder is the template)."""
 
-    def __init__(self, model: Any, *, device: str, max_batch_size: int = 8, max_batch_wait_ms: int = 2):
-        self._model = model
+    def __init__(self, audio_tokenizer: Any, *, device: str, max_batch_size: int = 8, max_batch_wait_ms: int = 2):
+        self._audio_tokenizer = audio_tokenizer
         self._device = torch.device(device)
         super().__init__(self._vocode_payload, batch_compute_fn=self._vocode_payloads,
                          max_batch_size=max_batch_size, max_batch_wait_ms=max_batch_wait_ms)
@@ -260,7 +274,8 @@ class BreezeVocoderScheduler(StreamingSimpleScheduler):
             import time
             state = self._validate(payload)
             t0 = time.perf_counter()
-            audio = decode_frames(self._model, state.output_codes)          # float32 [samples], CPU
+            audio, sample_rate = decode_frames(self._audio_tokenizer, state.output_codes)   # float32 [samples], CPU
+            state.sample_rate = sample_rate
             vocode_s = time.perf_counter() - t0
             frames = int(state.output_codes.shape[0])
             eng = state.engine_time_s or 0.0
@@ -287,6 +302,6 @@ def create_vocoder_executor(model_path: str, *, device: str | None = None, gpu_i
                             max_batch_size: int = 8, max_batch_wait_ms: int = 2):
     if device is None:
         device = f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
-    model = load_breeze_model(_resolve_checkpoint(model_path), device)
-    return BreezeVocoderScheduler(model, device=device, max_batch_size=max_batch_size,
+    audio_tokenizer = load_audio_tokenizer(_resolve_checkpoint(model_path), device)
+    return BreezeVocoderScheduler(audio_tokenizer, device=device, max_batch_size=max_batch_size,
                                   max_batch_wait_ms=max_batch_wait_ms)

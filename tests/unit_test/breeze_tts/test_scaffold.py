@@ -72,9 +72,28 @@ def test_prompt_embeds_match_the_reference_runtime():
 
 
 @needs_checkpoint
-def test_vocoder_decodes_frames_like_the_codec():
-    from sglang_omni.models.breeze_tts.stages import load_breeze_model, decode_frames
-    model = load_breeze_model(MODEL, DEVICE)
-    frames = torch.randint(0, 2048, (25, 16), device=DEVICE)        # 2 s of 12.5 Hz frames
-    audio = decode_frames(model, frames)
-    assert audio.ndim == 1 and 24000 * 1.8 < audio.numel() < 24000 * 2.2
+def test_vocoder_round_trips_a_reference_clip():
+    """encode a reference wav with the audio tokenizer, decode the codes with the
+    vocoder stage's path: same length (±1 frame) and clearly the same audio."""
+    import numpy as np
+    import soundfile as sf
+    from sglang_omni.models.breeze_tts.stages import load_audio_tokenizer, decode_frames
+    from sglang_omni.models.breeze_tts.tokenizer import breeze_src
+    breeze_src()
+    from breeze_infer.audio import encode_prompt_audio
+    ref_dir = os.environ.get("BREEZE_TEST_REF", "/workspace/self-hosted/services/tts/references/ash-final")
+    tok = load_audio_tokenizer(MODEL, DEVICE)
+    codes = encode_prompt_audio(tok, os.path.join(ref_dir, "sample.wav"))          # [T, 16]
+    audio, sr = decode_frames(tok, codes)
+    wav, wav_sr = sf.read(os.path.join(ref_dir, "sample.wav"), dtype="float32", always_2d=True)
+    seconds = wav.shape[0] / wav_sr
+    assert audio.ndim == 1 and abs(audio.numel() / sr - seconds) < 0.2
+    # loudness envelope correlation (robust to codec phase): the decode must track the original
+    import torch.nn.functional as F
+    def envelope(x: np.ndarray, rate: int, hop_ms: int = 20) -> torch.Tensor:
+        t = torch.as_tensor(x, dtype=torch.float32).abs().view(1, 1, -1)
+        return F.avg_pool1d(t, kernel_size=rate * hop_ms // 1000, stride=rate * hop_ms // 1000).flatten()
+    a, b = envelope(audio.numpy(), sr), envelope(wav.mean(1), wav_sr)
+    n = min(a.numel(), b.numel())
+    corr = torch.corrcoef(torch.stack([a[:n], b[:n]]))[0, 1].item()
+    assert corr > 0.8, f"decoded envelope correlation {corr:.2f}"
