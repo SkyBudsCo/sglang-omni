@@ -36,6 +36,10 @@ class BreezeEngineBuilder(TtsEngineBuilder):
             # depth-decoder loop run inside that capture (sglang_model._decode_codebooks).
             "disable_cuda_graph": bool(os.environ.get("BREEZE_SGL_NO_GRAPH")),
             "cuda_graph_max_bs": max_bs,
+            # Prompts arrive as embeddings behind placeholder ids (all zeros): with the radix
+            # cache on, a second request of the same length would "hit" the first one's prefix
+            # and reuse its KV — another voice, another text. No prefix sharing here.
+            "disable_radix_cache": True,
             "mem_fraction_static": float(os.environ.get("BREEZE_SGL_MEM_FRACTION", "0.35")),
             "chunked_prefill_size": 4096,
             "dtype": "bfloat16",
