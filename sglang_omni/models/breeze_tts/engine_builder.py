@@ -15,11 +15,17 @@ from . import request_builders
 
 class BreezeEngineBuilder(TtsEngineBuilder):
     model_name = "Breeze TTS 2"
-    context_length = 8192          # frames + prompt; the backbone allows 40960
+    model_arch_override = "BreezeForConditionalGeneration"
+    context_length = 2048          # the checkpoint's top-level max_position_embeddings; prompt + up to 750 frames
 
     def __init__(self, *, max_new_tokens: int) -> None:
         self.max_new_tokens = max_new_tokens
         self._stream_output_builder = None
+
+    def pre_infra_setup(self, checkpoint_dir: str) -> None:
+        del checkpoint_dir
+        from .hf_config import register_breeze_hf_config
+        register_breeze_hf_config()
 
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         del dtype

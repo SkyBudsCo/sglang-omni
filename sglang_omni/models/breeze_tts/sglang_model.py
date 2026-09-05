@@ -2,20 +2,22 @@
 """The Breeze TTS 2 backbone as an SGLang model (M2 of the port).
 
 What SGLang runs: the Qwen3 backbone (28 layers, hidden 2048, 16 heads / 8 KV,
-head_dim 128, ~1.7B) over prompt embeddings that preprocessing already merged
+head_dim 128) over prompt embeddings that preprocessing already merged
 (text-encoder features + reference-frame codebook embeddings), with a
 2051+1-way lm_head that predicts the FIRST codebook of the next 12.5 Hz frame
-(the +1 is the backbone's EOS). The decode-step input is not a token: it is
-the embedding SUM of the previous frame's 16 codebooks (breeze-tts's
-BreezeBackboneModelEmbeddings), so like Fish S2-Pro this model keeps its own
-per-request frame state and treats the token SGLang hands it as a trigger.
+(class 2051 is the backbone's EOS). The decode-step input is not a token: it is
+the SUM of the previous frame's 16 codebook embeddings (breeze-tts's
+BreezeBackboneModelEmbeddings), so like Fish S2-Pro this model keeps per-slot
+frame state on the GPU and ignores the token SGLang hands it.
 
-After the backbone's logits for a step, `_decode_codebooks` samples codebook 0,
-runs the depth decoder (12 layers, d=1024) for the other 15 codebooks
+Per step, `_decode_codebooks` samples codebook 0 (or EOS) from the backbone's
+logits the way the reference runtime does (temperature / top-k, reserved ids
+2048..2050 suppressed, repetition penalty over the codebook-0 history), then
+runs the eager depth decoder (12 layers, d=1024) for codebooks 1..15,
 conditioned on the backbone's last hidden state — batched across every running
-request — records the frame, and prepares the next step's input embedding.
-The depth decoder and the audio-embedding table are eager HF modules loaded
-from the checkpoint in `setup_breeze_decode`; only the backbone is SGLang.
+request — and stages the frame. The model runner copies the frame into the
+request, overrides SGLang's sampled token with ours (so stop / EOS logic
+agrees), and re-syncs each slot before the next step because batch rows move.
 """
 
 from __future__ import annotations
@@ -29,70 +31,102 @@ from torch import Tensor, nn
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import make_layers
 
 # Identical Qwen3 math (qk-norm, GQA, RoPE) — reuse the S2 layer implementation.
 from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
     S2ProDecoderLayer,
     _default_weight_loader,
 )
+from sglang_omni.vendor.sglang.utils import make_layers
 
 logger = logging.getLogger(__name__)
 
+REP_HISTORY_LEN = 64          # codebook-0 tokens the repetition penalty looks back over
+_NEG_INF = -float("inf")
+_DEBUG_STEPS = bool(__import__("os").environ.get("BREEZE_DEBUG_STEPS"))   # log row-0 logits per step
 
-class BreezeSGLangBackbone(nn.Module):
-    def __init__(self, config: Any = None, quant_config: Any = None) -> None:
+
+def _cfg(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+class BreezeForConditionalGeneration(nn.Module):
+    """Named after the HF architecture so the registry resolves it."""
+
+    def __init__(self, config: Any = None, quant_config: Any = None, prefix: str = "") -> None:
         super().__init__()
-        bb = config.backbone_config if hasattr(config, "backbone_config") else config
-        get = (lambda k, d=None: (bb.get(k, d) if isinstance(bb, dict) else getattr(bb, k, d)))
-        self.hidden_size = int(get("hidden_size", 2048))
-        self.num_layers = int(get("num_hidden_layers", 28))
-        self.num_codebooks = int(getattr(config, "audio_num_codebooks", 16))
-        self.codebook_size = int(getattr(config, "audio_vocab_size", 2051))
-        self.audio_embed_size = int(getattr(config, "audio_embed_size", self.hidden_size) or self.hidden_size)
-        self.eos_token_id = self.codebook_size          # lm_head's extra class
+        del quant_config, prefix
+        bb = _cfg(config, "backbone_config") or config
+        self.hidden_size = int(_cfg(bb, "hidden_size", 2048))
+        self.num_layers = int(_cfg(bb, "num_hidden_layers", 28))
+        self.num_codebooks = int(_cfg(config, "num_codebooks", _cfg(config, "audio_num_codebooks", 16)))
+        self.codebook_size = int(_cfg(config, "vocab_size", _cfg(config, "audio_vocab_size", 2051)))
+        self.codec_codebook_size = 2048                          # ids >= this (below EOS) are reserved
+        self.pad_token_id = int(_cfg(config, "codebook_pad_token_id", 2050))
+        self.eos_token_id = self.codebook_size                   # lm_head's extra class
+        self.audio_embed_size = int(_cfg(config, "audio_embed_size", 0) or self.hidden_size)
         self.layers = make_layers(
             self.num_layers,
             lambda idx, prefix: S2ProDecoderLayer(
                 hidden_size=self.hidden_size,
-                intermediate_size=int(get("intermediate_size", 6144)),
-                num_heads=int(get("num_attention_heads", 16)),
-                num_kv_heads=int(get("num_key_value_heads", 8)),
-                head_dim=int(get("head_dim", 128)),
+                intermediate_size=int(_cfg(bb, "intermediate_size", 6144)),
+                num_heads=int(_cfg(bb, "num_attention_heads", 16)),
+                num_kv_heads=int(_cfg(bb, "num_key_value_heads", 8)),
+                head_dim=int(_cfg(bb, "head_dim", 128)),
                 layer_id=idx,
-                rope_base=float(get("rope_theta", 1000000.0)),
-                max_position_embeddings=int(get("max_position_embeddings", 40960)),
-                rms_norm_eps=float(get("rms_norm_eps", 1e-6)),
+                rope_base=float(_cfg(bb, "rope_theta", 1000000.0)),
+                max_position_embeddings=int(_cfg(bb, "max_position_embeddings", 40960)),
+                rms_norm_eps=float(_cfg(bb, "rms_norm_eps", 1e-6)),
                 qk_norm=True,
             ),
+            prefix="layers",
         )
         from sglang.srt.layers.layernorm import RMSNorm
-        self.norm = RMSNorm(self.hidden_size, eps=float(get("rms_norm_eps", 1e-6)))
+        self.norm = RMSNorm(self.hidden_size, eps=float(_cfg(bb, "rms_norm_eps", 1e-6)))
         self.start_layer, self.end_layer = 0, self.num_layers
-        # first-codebook head: codebook_size + 1 (EOS)
         self.lm_head = ParallelLMHead(self.codebook_size + 1, self.hidden_size)
-        # audio embedding table: num_codebooks * codebook_size rows, summed per frame
+        # codebook embedding table: num_codebooks * codebook_size rows, summed per frame
         self.embed_audio_tokens = nn.Embedding(self.num_codebooks * self.codebook_size, self.audio_embed_size)
         self.audio_embeds_projector = (
             nn.Linear(self.audio_embed_size, self.hidden_size, bias=False)
             if self.audio_embed_size != self.hidden_size else None)
         self.register_buffer("audio_tokens_offsets",
                              torch.arange(self.num_codebooks) * self.codebook_size, persistent=False)
-        # decode state (setup_breeze_decode): the eager depth decoder + per-slot frames
+        # decode state (setup_breeze_decode)
         self.depth_decoder: Any = None
         self._decode_ready = False
-        self._last_frame: Tensor | None = None       # [max_bs, num_codebooks]
-        self._has_frame: Tensor | None = None        # [max_bs] bool: a frame exists for this slot
-        self._frame_sink: list[Any] = []             # per-slot request data (output_codes lists)
-        self._sampling: dict[str, Tensor] = {}
 
     # ------------------------------------------------------------------ setup
     def setup_breeze_decode(self, *, depth_decoder: Any, max_batch_size: int, device: str) -> None:
-        self.depth_decoder = depth_decoder.to(device).eval()
-        self._last_frame = torch.zeros(max_batch_size, self.num_codebooks, dtype=torch.long, device=device)
-        self._has_frame = torch.zeros(max_batch_size, dtype=torch.bool, device=device)
-        self._frame_sink = [None] * max_batch_size
+        """Attach the eager depth decoder and allocate per-slot GPU buffers."""
+        dev = torch.device(device)
+        self.depth_decoder = depth_decoder.to(dev).eval()
+        n = int(max_batch_size)
+        self._last_frame = torch.zeros(n, self.num_codebooks, dtype=torch.long, device=dev)   # next step's input
+        self._out_frame = torch.zeros(n, self.num_codebooks, dtype=torch.long, device=dev)    # this step's frame
+        self._out_token = torch.full((n,), self.eos_token_id, dtype=torch.long, device=dev)   # cb0 or EOS
+        self._temperature = torch.full((n,), 0.9, device=dev)
+        self._top_k = torch.full((n,), 50, dtype=torch.long, device=dev)
+        self._depth_temperature = torch.full((n,), 0.9, device=dev)
+        self._depth_top_k = torch.full((n,), 50, dtype=torch.long, device=dev)
+        self._rep_penalty = torch.full((n,), 1.1, device=dev)
+        self._prev_tokens = torch.zeros(n, REP_HISTORY_LEN, dtype=torch.long, device=dev)
+        self._prev_count = torch.zeros(n, dtype=torch.long, device=dev)
+        self._rep_positions = torch.arange(REP_HISTORY_LEN, device=dev)
+        # reserved ids (codec_codebook_size .. codebook_size-1, i.e. 2048..2050) are never sampled
+        bias = torch.zeros(self.codebook_size + 1, device=dev)
+        bias[self.codec_codebook_size:self.codebook_size] = _NEG_INF
+        self._backbone_bias = bias
+        self._depth_bias = bias[: self.codebook_size].clone()
         self._decode_ready = True
+
+    @property
+    def decode_max_batch_size(self) -> int:
+        return int(self._last_frame.shape[0]) if self._decode_ready else 0
 
     def frame_embeds(self, frames: Tensor) -> Tensor:
         """[bs, num_codebooks] codes → [bs, hidden]: the sum of the codebook embeddings."""
@@ -110,48 +144,86 @@ class BreezeSGLangBackbone(nn.Module):
             hidden_states = input_embeds                # the merged prompt (prefill)
         else:
             # decode: the previous frame's embedding, not the token SGLang sampled
-            bs = input_ids.shape[0]
             assert self._decode_ready, "setup_breeze_decode() before decoding"
+            bs = input_ids.shape[0]
             hidden_states = self.frame_embeds(self._last_frame[:bs]).to(self.lm_head.weight.dtype)
         residual = None
+        taps = {}
         for layer_idx in range(self.start_layer, self.end_layer):
             hidden_states, residual = self.layers[layer_idx](positions, hidden_states, forward_batch, residual)
+            if _DEBUG_STEPS and layer_idx in (0, 1, 2, self.end_layer - 1):
+                taps[layer_idx] = (hidden_states + residual)          # the residual stream after this layer
         hidden_states, _ = self.norm(hidden_states, residual)
         if forward_batch.forward_mode.is_extend():
             last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             hidden_states = hidden_states[last_index]
-        logits = self.lm_head(hidden_states)
+            if _DEBUG_STEPS:
+                for i, t in taps.items():
+                    v = t[last_index][0].float()
+                    logger.info("breeze tap layer%d last-pos: mean|x|=%.4f first4=%s", i, float(v.abs().mean()),
+                                [round(float(x), 4) for x in v[:4]])
+                v = hidden_states[0].float()
+                logger.info("breeze tap final-norm last-pos: mean|x|=%.4f first4=%s", float(v.abs().mean()),
+                            [round(float(x), 4) for x in v[:4]])
+                logger.info("breeze tap prefill positions: n=%d first=%s last=%s", int(positions.numel()),
+                            int(positions[0]), int(positions[-1]))
+        # ParallelLMHead refuses direct calls (its weight is meant for SGLang's sampler); the
+        # padded rows (2052 → 2112) are dropped so SGLang sees exactly codebook_size + 1 classes.
+        logits = torch.nn.functional.linear(hidden_states, self.lm_head.weight)[:, : self.codebook_size + 1]
         if self._decode_ready:
             self._decode_codebooks(logits, hidden_states)
         return LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden_states)
 
+    # --------------------------------------------------------------- sampling
+    def _sample(self, logits: Tensor, temperature: Tensor, top_k: Tensor) -> Tensor:
+        """Per-row temperature + top-k sampling on float logits [bs, V]."""
+        k_max = int(top_k.max().item()) if top_k.numel() else 0
+        if k_max > 0:
+            k_max = min(k_max, logits.shape[-1])
+            topk_vals, topk_idx = torch.topk(logits, k_max, dim=-1)
+            pos = torch.arange(k_max, device=logits.device).unsqueeze(0)
+            k_eff = torch.where(top_k > 0, top_k.clamp(max=k_max), torch.full_like(top_k, k_max))
+            topk_vals = topk_vals.masked_fill(pos >= k_eff.unsqueeze(1), _NEG_INF)
+            probs = torch.softmax(topk_vals / temperature.clamp(min=1e-5).unsqueeze(1), dim=-1)
+            choice = torch.multinomial(probs, 1)
+            return topk_idx.gather(-1, choice).squeeze(-1)
+        probs = torch.softmax(logits / temperature.clamp(min=1e-5).unsqueeze(1), dim=-1)
+        return torch.multinomial(probs, 1).squeeze(-1)
+
     @torch.no_grad()
     def _decode_codebooks(self, logits: Tensor, hidden_states: Tensor) -> None:
-        """Sample codebook 0, run the depth decoder for codebooks 1..15 (batched
-        over the running requests), record the frame, stage the next input."""
         bs = logits.shape[0]
-        cb0_logits = logits[:, : self.codebook_size].float()      # EOS is decided by SGLang from the full logits
-        temperature = self._sampling.get("temperature")
-        if temperature is not None:
-            cb0_logits = cb0_logits / temperature[:bs].unsqueeze(1).clamp(min=1e-3)
-        cb0 = torch.multinomial(torch.softmax(cb0_logits, dim=-1), 1).squeeze(1)   # [bs]
-        frame = torch.empty(bs, self.num_codebooks, dtype=torch.long, device=logits.device)
-        frame[:, 0] = cb0
-        seq = cb0.unsqueeze(1)                                                       # [bs, 1]
-        for step in range(1, self.num_codebooks):
-            out = self.depth_decoder(input_ids=seq, backbone_last_hidden_state=hidden_states,
+        lg = logits[:, : self.codebook_size + 1].float() + self._backbone_bias   # drop the lm_head's vocab padding
+        # repetition penalty over the codebook-0 history (reference: sample_logits with token_history)
+        prev = self._prev_tokens[:bs]
+        count = self._prev_count[:bs]
+        scores = torch.gather(lg, -1, prev)
+        pen = self._rep_penalty[:bs].unsqueeze(1)
+        penalized = torch.where(scores < 0, scores * pen, scores / pen)
+        valid = self._rep_positions.unsqueeze(0) < count.unsqueeze(1)
+        lg.scatter_(-1, prev, torch.where(valid, penalized, scores))
+        token = self._sample(lg, self._temperature[:bs], self._top_k[:bs])            # cb0 or EOS
+        if _DEBUG_STEPS:
+            raw = logits[0, : self.codebook_size + 1].float()
+            top = torch.topk(raw, 5)
+            logger.info("breeze step row0 n=%d top5=%s eos_logit=%.2f chosen=%d",
+                        int(self._prev_count[0].item()), [(int(i), round(float(v), 2)) for v, i in zip(top.values, top.indices)],
+                        float(raw[self.eos_token_id]), int(token[0]))
+        is_eos = token == self.eos_token_id
+        cb0 = torch.where(is_eos, torch.zeros_like(token), token)
+        # depth decoder: [dummy, cb0, .., cb_{k-1}] → codebook k at the last position
+        seq = torch.cat([torch.zeros(bs, 1, dtype=torch.long, device=logits.device), cb0.unsqueeze(1)], dim=1)
+        depth_hidden = hidden_states.to(self.depth_decoder.dtype if hasattr(self.depth_decoder, "dtype") else torch.bfloat16)
+        for _ in range(1, self.num_codebooks):
+            out = self.depth_decoder(input_ids=seq, backbone_last_hidden_state=depth_hidden,
                                      use_cache=False, return_dict=True)
-            step_logits = out.logits[:, -1, :].float()
-            step_logits[:, self.codebook_size - 1] = -float("inf")                 # pad id, never sampled
-            tok = torch.multinomial(torch.softmax(step_logits, dim=-1), 1)          # [bs, 1]
-            frame[:, step] = tok.squeeze(1)
-            seq = torch.cat([seq, tok], dim=1)
+            step_logits = out.logits[:, -1, :].float() + self._depth_bias
+            tok = self._sample(step_logits, self._depth_temperature[:bs], self._depth_top_k[:bs])
+            seq = torch.cat([seq, tok.unsqueeze(1)], dim=1)
+        frame = seq[:, 1:]
+        self._out_frame[:bs] = frame
+        self._out_token[:bs] = token
         self._last_frame[:bs] = frame
-        self._has_frame[:bs] = True
-        for i in range(bs):
-            sink = self._frame_sink[i]
-            if sink is not None:
-                sink.output_codes.append(frame[i].detach().cpu())
 
     # ---------------------------------------------------------------- weights
     def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> None:
@@ -159,19 +231,39 @@ class BreezeSGLangBackbone(nn.Module):
         embeddings and the lm_head live here; the depth decoder, text encoder
         and codec are loaded eagerly by the stages."""
         params = dict(self.named_parameters())
-        stacked = {}   # fused qkv / gate_up assembled from the per-projection tensors
+        # per-projection checkpoint tensors → shards of sglang's fused layers. The S2 layer keeps its
+        # MLP projections directly on the layer (gate_up_proj / down_proj, no `mlp.`); resolve either.
+        fused = {
+            "self_attn.q_proj.weight": ("self_attn.qkv_proj.weight", "q"),
+            "self_attn.k_proj.weight": ("self_attn.qkv_proj.weight", "k"),
+            "self_attn.v_proj.weight": ("self_attn.qkv_proj.weight", "v"),
+            "mlp.gate_proj.weight": ("mlp.gate_up_proj.weight", 0),
+            "mlp.up_proj.weight": ("mlp.gate_up_proj.weight", 1),
+        }
+
+        def resolve(idx: str, sub: str) -> str | None:
+            for cand in (f"layers.{idx}.{sub}", f"layers.{idx}.{sub.replace('mlp.', '', 1)}"):
+                if cand in params:
+                    return cand
+            return None
+
         loaded: set[str] = set()
         for name, w in weights:
             if name.startswith("backbone_model.layers."):
                 rest = name[len("backbone_model.layers."):]
                 idx, sub = rest.split(".", 1)
-                if sub.startswith("self_attn.") and any(p in sub for p in ("q_proj", "k_proj", "v_proj")):
-                    stacked.setdefault((idx, "qkv"), {})[sub.split(".")[1]] = w
+                if sub in fused:
+                    target_sub, shard = fused[sub]
+                    target = resolve(idx, target_sub)
+                    if target is None:
+                        raise KeyError(f"breeze backbone: no parameter for {name} (tried {target_sub})")
+                    param = params[target]
+                    param.weight_loader(param, w, shard)
+                    loaded.add(target)
                     continue
-                if sub.startswith("mlp.") and any(p in sub for p in ("gate_proj", "up_proj")):
-                    stacked.setdefault((idx, "gate_up"), {})[sub.split(".")[1]] = w
-                    continue
-                target = f"layers.{idx}.{sub}"             # o_proj, down_proj, both layernorms, q_norm/k_norm
+                target = resolve(idx, sub)                 # o_proj, down_proj, both layernorms, q_norm/k_norm
+                if target is None:
+                    raise KeyError(f"breeze backbone: no parameter for {name}; sample: {sorted(params)[:8]}")
             elif name == "backbone_model.norm.weight":
                 target = "norm.weight"
             elif name in ("backbone_model.embed_tokens.embed_audio_tokens.weight",
@@ -186,23 +278,26 @@ class BreezeSGLangBackbone(nn.Module):
                 target = "lm_head.weight"
             else:
                 continue     # text_encoder.*, depth_decoder.* (rest), codec_model.*, embed_text_tokens.*, text_encoder_proj
-            loaded.add(target)
             if target not in params:
                 logger.debug("breeze: no parameter for %s (from %s)", target, name)
                 continue
-            _default_weight_loader(params[target], w)
-        for (idx, kind), parts in stacked.items():
-            if kind == "qkv":
-                fused = torch.cat([parts["q_proj"], parts["k_proj"], parts["v_proj"]], dim=0)
-                _default_weight_loader(params[f"layers.{idx}.self_attn.qkv_proj.weight"], fused)
+            param = params[target]
+            if target == "lm_head.weight" and param.shape[0] > w.shape[0]:
+                # ParallelLMHead pads the vocab to a multiple of 64 (2052 → 2112); the extra rows stay zero
+                param.data[: w.shape[0]].copy_(w.to(param.dtype))
+                param.data[w.shape[0]:].zero_()
             else:
-                fused = torch.cat([parts["gate_proj"], parts["up_proj"]], dim=0)
-                _default_weight_loader(params[f"layers.{idx}.mlp.gate_up_proj.weight"], fused)
-            loaded.add(f"layers.{idx}.{kind}")
-        expected = {"norm.weight", "lm_head.weight", "embed_audio_tokens.weight"}
+                weight_loader = getattr(param, "weight_loader", _default_weight_loader)
+                weight_loader(param, w)
+            loaded.add(target)
+        last = str(self.num_layers - 1)
+        expected = {"norm.weight", "lm_head.weight", "embed_audio_tokens.weight",
+                    resolve(last, "self_attn.qkv_proj.weight"), resolve(last, "mlp.gate_up_proj.weight")}
         missing = expected - loaded
         if missing:
             raise ValueError(f"breeze backbone: checkpoint did not provide {sorted(missing)}")
 
 
-EntryClass = BreezeSGLangBackbone
+# The registry keys on the HF architecture name.
+BreezeSGLangBackbone = BreezeForConditionalGeneration
+EntryClass = BreezeForConditionalGeneration

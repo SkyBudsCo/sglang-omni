@@ -46,7 +46,7 @@ class BreezePipelineConfig(PipelineConfig):
             factory=FactoryArgs(device="cuda:0", max_new_tokens=1024),
             gpu=0,
             next="vocoder",
-            stream_to=["vocoder"],
+            # M3 adds stream_to=["vocoder"] with a streaming Mimi decoder.
         ),
         StageConfig(
             name="vocoder",
@@ -54,7 +54,6 @@ class BreezePipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_vocoder_executor",
             gpu=0,
             terminal=True,
-            can_accept_stream_before_payload=True,
         ),
     ]
 

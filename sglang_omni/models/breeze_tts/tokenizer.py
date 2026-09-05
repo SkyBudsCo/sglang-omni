@@ -54,6 +54,27 @@ def _shim_transformers_5() -> None:
     import transformers.modeling_rope_utils as rope_utils
     if "default" not in rope_utils.ROPE_INIT_FUNCTIONS:      # 5.x dropped the key; qwen-tts looks it up
         rope_utils.ROPE_INIT_FUNCTIONS["default"] = _default_rope_parameters
+    import inspect
+    import transformers.masking_utils as masking_utils
+    for fn_name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        original_mask = getattr(masking_utils, fn_name, None)
+        if original_mask is None or getattr(original_mask, "_breeze_tolerant", False):
+            continue
+        accepted = set(inspect.signature(original_mask).parameters)
+
+        def make_mask(*args, _original=original_mask, _accepted=accepted, **kwargs):
+            # 4.57 called (config, input_embeds, attention_mask, cache_position, past_key_values,
+            # position_ids); 5.x renamed input_embeds and derives positions differently.
+            if "input_embeds" in kwargs:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+            cache_position = kwargs.get("cache_position")
+            if "position_ids" in _accepted and kwargs.get("position_ids") is None and cache_position is not None:
+                kwargs["position_ids"] = cache_position.unsqueeze(0)
+            kwargs = {k: v for k, v in kwargs.items() if k in _accepted}
+            return _original(*args, **kwargs)
+
+        make_mask._breeze_tolerant = True
+        setattr(masking_utils, fn_name, make_mask)
     import transformers.utils.generic as generic
     original_check = generic.check_model_inputs
     if not getattr(original_check, "_breeze_tolerant", False):

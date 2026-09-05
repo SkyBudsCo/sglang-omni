@@ -204,9 +204,22 @@ class BreezeVocoderScheduler(StreamingSimpleScheduler):
         out: list[StagePayload] = []
         for payload in payloads:
             state = self._validate(payload)
-            audio = decode_frames(self._model, state.output_codes)
+            audio = decode_frames(self._model, state.output_codes)          # float32 [samples], CPU
+            frames = int(state.output_codes.shape[0])
+            logger.info("breeze vocoder %s: %d frames → %.2f s (%s)", payload.request_id, frames,
+                        audio.shape[-1] / state.sample_rate, state.finish_reason)
             state.audio_samples = audio
-            out.append(store_state(payload, state))
+            done = store_state(payload, state)
+            # what the client reads off the terminal payload (same keys the S2 vocoder emits;
+            # plain lists — the payload is serialized across processes)
+            done.data["audio_data"] = audio.tolist()
+            done.data["sample_rate"] = int(state.sample_rate)
+            done.data["modality"] = "audio"
+            done.data["usage"] = {"prompt_tokens": int(state.prompt_tokens or 0),
+                                  "completion_tokens": frames, "total_tokens": int(state.prompt_tokens or 0) + frames}
+            if state.finish_reason is not None:
+                done.data["finish_reason"] = state.finish_reason
+            out.append(done)
         return out
 
 

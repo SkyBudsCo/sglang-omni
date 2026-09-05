@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model runner for the Breeze backbone: hands SGLang the pre-embedded prompt
-on prefill and, on every decode step, tells the model which request sits in
-which batch row so the previous frame's embedding — not a token — is the input."""
+"""Model runner for the Breeze backbone.
+
+Prefill: hands SGLang the pre-embedded prompt. Every step: re-syncs each batch
+row's slot on the model (sampling params, codebook-0 history, the last frame —
+rows move between steps), and after the forward copies the frame the model
+staged into the request and overrides SGLang's sampled token with the model's
+codebook-0 / EOS choice so scheduling, stop and streaming logic agree."""
 
 from __future__ import annotations
 
@@ -11,11 +15,14 @@ import torch
 
 from sglang_omni.model_runner.base import ModelRunner
 
+from .sglang_model import REP_HISTORY_LEN
+
 
 class BreezeModelRunner(ModelRunner):
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
 
+    # ------------------------------------------------------------------ hooks
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         self._sync_rows(requests)
@@ -26,26 +33,54 @@ class BreezeModelRunner(ModelRunner):
         self._sync_rows(requests)
 
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
-        del result, forward_batch, schedule_batch, requests
+        del forward_batch, schedule_batch
+        self._collect(result, requests)
 
     def post_decode(self, result, forward_batch, schedule_batch, requests):
-        del result, forward_batch, schedule_batch, requests
+        del forward_batch, schedule_batch
+        self._collect(result, requests)
 
+    # --------------------------------------------------------------- per row
     def _sync_rows(self, requests: list) -> None:
-        """Row i of the batch ↔ request i: sampling params, the frame sink the
-        model appends to, and the last frame (the next step's input)."""
         model = self.model
         for row, sched_req in enumerate(requests):
             data = sched_req.data
-            model._frame_sink[row] = data
-            if data.output_codes:
-                model._last_frame[row].copy_(data.output_codes[-1].to(model._last_frame.device))
-                model._has_frame[row] = True
-            else:
-                model._has_frame[row] = False
-            temp = model._sampling.setdefault(
-                "temperature", torch.ones(model._last_frame.shape[0], device=model._last_frame.device))
-            temp[row] = float(data.temperature or 1.0)
+            model._temperature[row] = float(data.temperature)
+            model._top_k[row] = int(data.top_k)
+            model._depth_temperature[row] = float(getattr(data, "depth_temperature", 0.9))
+            model._depth_top_k[row] = int(getattr(data, "depth_top_k", 50))
+            model._rep_penalty[row] = float(data.repetition_penalty)
+            history = data.cb0_history[-REP_HISTORY_LEN:]
+            n = len(history)
+            if n:
+                model._prev_tokens[row, :n] = torch.as_tensor(history, dtype=torch.long,
+                                                              device=model._prev_tokens.device)
+            model._prev_count[row] = n
+            if data.last_frame is not None:
+                model._last_frame[row].copy_(data.last_frame.to(model._last_frame.device))
+
+    def _collect(self, result: Any, requests: list) -> None:
+        """After a forward: the model's codebook-0 / EOS choice replaces
+        SGLang's sample; complete frames go to the request."""
+        bs = len(requests)
+        if bs == 0:
+            return
+        model = self.model
+        tokens = model._out_token[:bs]
+        result.next_token_ids = tokens.clone()
+        frames = model._out_frame[:bs]
+        token_list = tokens.tolist()
+        for row, sched_req in enumerate(requests):
+            data = sched_req.data
+            if getattr(data.req, "inflight_middle_chunks", 0) > 0:
+                continue                      # chunked prefill: no frame until the last chunk
+            token = token_list[row]
+            if token == model.eos_token_id:
+                continue
+            frame = frames[row].clone()
+            data.last_frame = frame
+            data.cb0_history.append(int(token))
+            data.output_codes.append(frame.cpu())
 
     def _build_prefill_input_embeds(self, forward_batch: Any, requests: list) -> torch.Tensor:
         """Concatenate each request's prefill_input_embeds over the range SGLang

@@ -24,9 +24,13 @@ class BreezeSGLangRequestData(SGLangARRequestData):
     backbone_eos_token_id: int = 2051
     prompt_len: int = 0
     seed: int | None = None
-    # Frames the model has produced so far, [num_codebooks] each — appended by
-    # sglang_model._decode_codebooks, drained by the stream output builder.
+    # Frames the model has produced so far, [num_codebooks] each (CPU) —
+    # appended by the model runner, drained by the stream output builder.
     output_codes: list[torch.Tensor] = field(default_factory=list)
+    last_frame: torch.Tensor | None = None          # GPU copy of the newest frame: the next step's input
+    cb0_history: list[int] = field(default_factory=list)   # for the repetition penalty
+    depth_temperature: float = 0.9
+    depth_top_k: int = 50
     streamed_frames: int = 0
     engine_start_s: float | None = None
 
@@ -57,6 +61,7 @@ def build_sglang_tts_request(
         repetition_penalty=float(state.repetition_penalty),
         stop_token_ids=[eos],
     )
+    sampling_params.normalize(None)     # initializes stop_strs / stop-string state the scheduler reads
     sampling_params.verify(vocab_size)
     req = Req(
         rid=request_id,
@@ -119,13 +124,12 @@ def make_tts_scheduler_adapters(*, max_new_tokens_cap: int | None = None,
         return StagePayload(request_id=payload.request_id, request=payload.request,
                             data=state.to_dict())
 
-    def stream_output_builder(data: BreezeSGLangRequestData) -> dict[str, Any] | None:
-        """New frames since the last call, for the streaming vocoder (M3)."""
-        n = len(data.output_codes)
-        if n <= data.streamed_frames:
-            return None
-        chunk = torch.stack(data.output_codes[data.streamed_frames:n], dim=0)
-        data.streamed_frames = n
-        return {"codes": chunk, "frame_offset": n - int(chunk.shape[0])}
+    def stream_output_builder(request_id: str, data: BreezeSGLangRequestData, req_output: Any) -> list:
+        """Per-step hook from the OmniScheduler. M2 vocodes whole utterances, so
+        nothing streams yet; M3 returns OutgoingMessage(type="stream",
+        target="vocoder") chunks of new frames here (see the S2 builder)."""
+        del request_id, req_output
+        data.streamed_frames = len(data.output_codes)
+        return []
 
     return request_builder, result_adapter, stream_output_builder
