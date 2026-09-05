@@ -177,12 +177,17 @@ class BreezePromptAdapter:
         """input_ids / attention_mask / text_ids_mask / text_ids_len /
         input_values for one request, exactly as the reference runtime builds
         them. Single branch (no classifier-free guidance) in M1."""
+        return self.prepare_inputs_batch([req], req.template)
+
+    def prepare_inputs_batch(self, reqs: list[BreezeRequest], template: str) -> dict[str, Any]:
+        """The same for several requests sharing a template: a left-padded batch
+        (attention_mask marks the real tokens)."""
         return self._templates.prepare_inputs(
             self.tokenizer,
             self.audio_tokenizer,
             self.model,
-            [req.request],
-            self._templates.get_template(req.template),
+            [r.request for r in reqs],
+            self._templates.get_template(template),
             guidance_scale=1.0,
             guidance_scale_ref=None,
             guidance_scale_ins=None,

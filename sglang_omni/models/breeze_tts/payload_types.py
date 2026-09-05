@@ -20,6 +20,13 @@ class BreezeState(DeclarativeStateBase):
     # reference frames' codebook embeddings merged by breeze-tts's own
     # _merge_input_ids_with_input_values. [prompt_len, hidden] bf16.
     prefill_embeds: Any | None = wire(None, codec="tensor_restore")
+    # …or, the default, the ingredients: the engine embeds the prompt itself on its own
+    # stream (batched over the prompts it prefills), so the text encoder never contends
+    # with decode steps from another process. Exactly breeze-tts's prepare_inputs output.
+    input_ids: Any | None = wire(None, codec="tensor_list")          # [prompt_len]
+    text_ids_mask: Any | None = wire(None, codec="tensor_list")      # [prompt_len] bool
+    text_ids_len: Any | None = wire(None, codec="tensor_list")       # [num_text_segments]
+    input_values: Any | None = wire(None, codec="tensor_restore")    # [T_ref, num_codebooks] reference codes
     prompt_len: int = 0
     num_codebooks: int = 16
     codebook_size: int = 2051

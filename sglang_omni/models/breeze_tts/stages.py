@@ -178,63 +178,157 @@ def _install_reference_code_cache(adapter: BreezePromptAdapter, max_items: int =
     templates._encode_prompt_audio = cached
 
 
-def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, device: str = "cuda:0"):
-    """Threaded preprocessing on one GPU copy of the model's encoders."""
-    import tempfile
-    from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
-    checkpoint_dir = _resolve_checkpoint(model_path)
-    model = load_breeze_model(checkpoint_dir, device)
-    adapter = BreezePromptAdapter(checkpoint_dir, model, device)
-    _install_reference_code_cache(adapter)
-    scratch_dir = tempfile.mkdtemp(prefix="breeze-refs-")
-    lock = __import__("threading").Lock()          # one GPU model, many workers
-    # The engine shares this GPU and keeps it busy with back-to-back graph replays; a
-    # high-priority stream lets a prompt's text-encoder work interleave instead of queueing.
-    stream = torch.cuda.Stream(device=device, priority=-1) if device.startswith("cuda") else None
+class _PromptModelStub:
+    """What breeze_infer.templates.prepare_inputs reads off the model when only
+    the tokenizers are loaded: the config (num_codebooks) and a device."""
 
-    def _preprocess(payload: StagePayload) -> StagePayload:
-        import time
-        t0 = time.perf_counter()
+    def __init__(self, config: Any, device: str) -> None:
+        self.config = config
+        self.device = device
+
+
+class BreezePreprocessScheduler(StreamingSimpleScheduler):
+    """Tokenizes the prompt and encodes (cached) reference codes — CPU work plus
+    the audio tokenizer — and ships breeze-tts's prepare_inputs tensors. The
+    prompt embedding itself (text encoder + merge) happens in the engine
+    process (model_runner.before_prefill), batched over the prompts being
+    prefilled, on the engine's own stream: run here it contended with the
+    engine's decode steps (0.05 s idle → 0.5 s per prompt under load).
+    BREEZE_EMBED_IN_PREPROCESS=1 keeps the old behaviour (GPU model here)."""
+
+    def __init__(self, model: Any, adapter: BreezePromptAdapter, *, device: str,
+                 max_batch_size: int = 8, max_batch_wait_ms: int = 10):
+        import tempfile
+        self._model = model
+        self._adapter = adapter
+        self._device = device
+        self._embed_here = model is not None and not isinstance(model, _PromptModelStub)
+        self._scratch_dir = tempfile.mkdtemp(prefix="breeze-refs-")
+        # a high-priority stream lets prompt work interleave with the engine's replays
+        self._stream = torch.cuda.Stream(device=device, priority=-1) if (self._embed_here and device.startswith("cuda")) else None
+        super().__init__(self._one, batch_compute_fn=self._many,
+                         max_batch_size=max_batch_size, max_batch_wait_ms=max_batch_wait_ms)
+
+    def is_streaming_payload(self, payload: StagePayload) -> bool:
+        return False
+
+    def validate_non_streaming_payload(self, payload: StagePayload) -> None:
+        return None
+
+    def _one(self, payload: StagePayload) -> StagePayload:
+        return self._many([payload])[0]
+
+    def _build(self, payload: StagePayload):
         inputs = payload.request.inputs or {}
-        params = payload.request.params or {}
         if isinstance(inputs, str):
             inputs = {"text": inputs}
         refs = inputs.get("references") or []
-        reference = _reference_from_payload(refs[0], scratch_dir) if refs else None
-        request = adapter.build_request(text=inputs.get("text", ""), reference=reference,
-                                        instruction=inputs.get("instruction"),
-                                        speaker=inputs.get("speaker", "S0"),
-                                        request_id=payload.request_id)
-        # One prompt at a time on the GPU: without the lock a burst of prompts contends with the
-        # engine's decode steps and everything slows (merge 0.4 s → 3 s, engine step +50%).
-        with lock, (torch.cuda.stream(stream) if stream is not None else __import__("contextlib").nullcontext()):
-            t1 = time.perf_counter()
-            inputs_t = adapter.prepare_inputs(request)                      # reference codes + token ids
-            t2 = time.perf_counter()
-            merged = model._merge_input_ids_with_input_values(
-                input_ids=inputs_t["input_ids"], input_values=inputs_t.get("input_values"),
-                text_ids_mask=inputs_t["text_ids_mask"], text_ids_len=inputs_t["text_ids_len"],
-                attention_mask=inputs_t.get("attention_mask"))
-            embeds = merged_embeds(merged)[0].to(torch.bfloat16).cpu()
-            if stream is not None:
-                stream.synchronize()
-            t3 = time.perf_counter()
-        state = BreezeState(
-            prefill_embeds=embeds,
-            prompt_len=int(embeds.shape[0]),
-            max_new_tokens=int(params.get("max_new_tokens", 1024)),
-            temperature=float(params.get("temperature", 0.9)),
-            top_p=float(params.get("top_p", 1.0)),
-            top_k=int(params.get("top_k", 50)),
-            repetition_penalty=float(params.get("repetition_penalty", 1.1)),
-            seed=params.get("seed"),
-            preprocess_encode_s=t2 - t1,
-            preprocess_merge_s=t3 - t2,
-            preprocess_time_s=time.perf_counter() - t0,
-        )
-        return store_state(payload, state)
+        reference = _reference_from_payload(refs[0], self._scratch_dir) if refs else None
+        return self._adapter.build_request(text=inputs.get("text", ""), reference=reference,
+                                           instruction=inputs.get("instruction"),
+                                           speaker=inputs.get("speaker", "S0"),
+                                           request_id=payload.request_id)
 
-    return ThreadedSimpleScheduler(_preprocess, max_concurrency=max(1, int(max_concurrency)))
+    def _many(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        if not self._embed_here:
+            return self._tokenize_only(payloads)
+        return self._embed_batch(payloads)
+
+    def _tokenize_only(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        import time
+        out: list[StagePayload] = []
+        for payload in payloads:
+            t0 = time.perf_counter()
+            request = self._build(payload)
+            inputs_t = self._adapter.prepare_inputs(request)              # unpadded, one prompt
+            t1 = time.perf_counter()
+            params = payload.request.params or {}
+            ids = inputs_t["input_ids"][0]
+            values = inputs_t.get("input_values")
+            state = BreezeState(
+                input_ids=ids.tolist(),
+                text_ids_mask=inputs_t["text_ids_mask"][0].tolist(),
+                text_ids_len=inputs_t["text_ids_len"].tolist(),
+                input_values=values[0].to(torch.long).cpu() if values is not None else None,
+                prompt_len=int(ids.shape[0]),
+                max_new_tokens=int(params.get("max_new_tokens", 1024)),
+                temperature=float(params.get("temperature", 0.9)),
+                top_p=float(params.get("top_p", 1.0)),
+                top_k=int(params.get("top_k", 50)),
+                repetition_penalty=float(params.get("repetition_penalty", 1.1)),
+                seed=params.get("seed"),
+                preprocess_encode_s=t1 - t0,
+                preprocess_merge_s=0.0,
+                preprocess_time_s=time.perf_counter() - t0,
+            )
+            out.append(store_state(payload, state))
+        return out
+
+    def _embed_batch(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        import contextlib
+        import time
+        t0 = time.perf_counter()
+        requests = [self._build(p) for p in payloads]
+        embeds_by_index: dict[int, torch.Tensor] = {}
+        encode_s = merge_s = 0.0
+        with (torch.cuda.stream(self._stream) if self._stream is not None else contextlib.nullcontext()):
+            # one padded batch per template (with / without a reference)
+            groups: dict[str, list[int]] = {}
+            for i, req in enumerate(requests):
+                groups.setdefault(req.template, []).append(i)
+            for template, idxs in groups.items():
+                t1 = time.perf_counter()
+                inputs_t = self._adapter.prepare_inputs_batch([requests[i] for i in idxs], template)
+                t2 = time.perf_counter()
+                merged = self._model._merge_input_ids_with_input_values(
+                    input_ids=inputs_t["input_ids"], input_values=inputs_t.get("input_values"),
+                    text_ids_mask=inputs_t["text_ids_mask"], text_ids_len=inputs_t["text_ids_len"],
+                    attention_mask=inputs_t.get("attention_mask"))
+                batch_embeds = merged_embeds(merged)                       # [B, L_max, hidden], left-padded
+                mask = inputs_t["attention_mask"].bool()
+                for row, i in enumerate(idxs):
+                    embeds_by_index[i] = batch_embeds[row][mask[row]].to(torch.bfloat16).cpu()
+                if self._stream is not None:
+                    self._stream.synchronize()
+                encode_s += t2 - t1
+                merge_s += time.perf_counter() - t2
+        out: list[StagePayload] = []
+        for i, payload in enumerate(payloads):
+            params = payload.request.params or {}
+            embeds = embeds_by_index[i]
+            state = BreezeState(
+                prefill_embeds=embeds,
+                prompt_len=int(embeds.shape[0]),
+                max_new_tokens=int(params.get("max_new_tokens", 1024)),
+                temperature=float(params.get("temperature", 0.9)),
+                top_p=float(params.get("top_p", 1.0)),
+                top_k=int(params.get("top_k", 50)),
+                repetition_penalty=float(params.get("repetition_penalty", 1.1)),
+                seed=params.get("seed"),
+                preprocess_encode_s=encode_s,
+                preprocess_merge_s=merge_s,
+                preprocess_time_s=time.perf_counter() - t0,
+            )
+            out.append(store_state(payload, state))
+        return out
+
+
+def create_preprocessing_executor(model_path: str, *, max_concurrency: int = 4, device: str = "cuda:0",
+                                  max_batch_size: int = 8, max_batch_wait_ms: int = 10):
+    """Tokenization + reference codes (default) or, with BREEZE_EMBED_IN_PREPROCESS=1,
+    micro-batched prompt embedding on one GPU copy of the model's encoders."""
+    del max_concurrency
+    checkpoint_dir = _resolve_checkpoint(model_path)
+    if os.environ.get("BREEZE_EMBED_IN_PREPROCESS"):
+        model = load_breeze_model(checkpoint_dir, device)
+    else:
+        breeze_src()
+        from models.breeze_config import BreezeConfig
+        model = _PromptModelStub(BreezeConfig.from_pretrained(checkpoint_dir), device)
+    adapter = BreezePromptAdapter(checkpoint_dir, model, device)
+    _install_reference_code_cache(adapter)
+    return BreezePreprocessScheduler(model, adapter, device=device,
+                                     max_batch_size=max_batch_size, max_batch_wait_ms=max_batch_wait_ms)
 
 
 def create_sglang_tts_engine_executor(model_path: str, *, device: str = "cuda", max_new_tokens: int = 1024,

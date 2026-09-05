@@ -24,6 +24,8 @@ class BreezeSGLangRequestData(SGLangARRequestData):
     backbone_eos_token_id: int = 2051
     prompt_len: int = 0
     seed: int | None = None
+    # breeze-tts prepare_inputs tensors (CPU) when the engine embeds the prompt itself
+    prompt_inputs: dict[str, Any] | None = None
     # Frames the model has produced so far, [num_codebooks] each (CPU) —
     # appended by the model runner, drained by the stream output builder.
     output_codes: list[torch.Tensor] = field(default_factory=list)
@@ -47,9 +49,22 @@ def build_sglang_tts_request(
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     embeds = state.prefill_embeds
-    if not isinstance(embeds, torch.Tensor):
-        embeds = torch.as_tensor(embeds)
-    prompt_len = int(embeds.shape[0])
+    prompt_inputs = None
+    if embeds is not None:
+        if not isinstance(embeds, torch.Tensor):
+            embeds = torch.as_tensor(embeds)
+        embeds = embeds.to(torch.bfloat16)
+        prompt_len = int(embeds.shape[0])
+    else:
+        # the engine embeds the prompt at prefill (model_runner) from these
+        prompt_inputs = {
+            "input_ids": torch.as_tensor(state.input_ids, dtype=torch.long),
+            "text_ids_mask": torch.as_tensor(state.text_ids_mask, dtype=torch.bool),
+            "text_ids_len": torch.as_tensor(state.text_ids_len, dtype=torch.long),
+            "input_values": (torch.as_tensor(state.input_values, dtype=torch.long)
+                             if state.input_values is not None else None),
+        }
+        prompt_len = int(prompt_inputs["input_ids"].shape[0])
     placeholder_ids = [0] * prompt_len
     eos = int(state.backbone_eos_token_id)
     # The backbone's vocabulary is the first codebook (+1 for EOS).
@@ -76,7 +91,8 @@ def build_sglang_tts_request(
     return BreezeSGLangRequestData(
         input_ids=torch.tensor(placeholder_ids, dtype=torch.long),
         req=req,
-        prefill_input_embeds=embeds.to(torch.bfloat16),
+        prefill_input_embeds=embeds,
+        prompt_inputs=prompt_inputs,
         input_embeds_are_projected=True,
         num_codebooks=int(state.num_codebooks),
         codebook_size=int(state.codebook_size),

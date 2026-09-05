@@ -166,11 +166,46 @@ class BreezeModelRunner(ModelRunner):
             data.cb0_history.append(int(token))
             data.output_codes.append(frames_cpu[row])
 
+    @torch.no_grad()
+    def _embed_prompts(self, requests: list, device: torch.device) -> None:
+        """Prompts that arrived as breeze-tts prepare_inputs tensors are embedded
+        here — one left-padded batch through the HF text encoder + merge on the
+        engine's stream — and cached on the request (chunked prefill re-enters)."""
+        todo = [sr.data for sr in requests if sr.data.prefill_input_embeds is None and sr.data.prompt_inputs is not None]
+        if not todo:
+            return
+        hf = self.model.hf_prompt_model
+        pad_id = int(getattr(hf.config, "pad_token_id", 0) or 0)
+        max_len = max(int(d.prompt_inputs["input_ids"].shape[0]) for d in todo)
+        ids = torch.full((len(todo), max_len), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(todo), max_len), dtype=torch.long)
+        tmask = torch.zeros((len(todo), max_len), dtype=torch.bool)
+        lens, values = [], []
+        for row, d in enumerate(todo):
+            pi = d.prompt_inputs
+            n = int(pi["input_ids"].shape[0])
+            ids[row, max_len - n:] = pi["input_ids"]                    # left padding, as _collate_inputs
+            attn[row, max_len - n:] = 1
+            tmask[row, max_len - n:] = pi["text_ids_mask"]
+            lens.append(pi["text_ids_len"])
+            if pi["input_values"] is not None:
+                values.append(pi["input_values"])
+        input_values = torch.cat(values, dim=0).unsqueeze(0).to(device) if values else None
+        merged = hf._merge_input_ids_with_input_values(
+            input_ids=ids.to(device), input_values=input_values, text_ids_mask=tmask.to(device),
+            text_ids_len=torch.cat(lens).to(device), attention_mask=attn.to(device))
+        embeds = merged["inputs_embeds"] if isinstance(merged, dict) else merged
+        attn_b = attn.bool().to(device)
+        for row, d in enumerate(todo):
+            d.prefill_input_embeds = embeds[row][attn_b[row]].to(torch.bfloat16)
+            d.prompt_inputs = None
+
     def _build_prefill_input_embeds(self, forward_batch: Any, requests: list) -> torch.Tensor:
         """Concatenate each request's prefill_input_embeds over the range SGLang
         is extending this step (chunked prefill / prefix cache aware)."""
         input_ids = forward_batch.input_ids
         device = input_ids.device
+        self._embed_prompts(requests, device)
         pieces: list[torch.Tensor] = []
         for sched_req in requests:
             data = sched_req.data

@@ -58,7 +58,8 @@ class BreezeEngineBuilder(TtsEngineBuilder):
         hf = load_breeze_model(checkpoint_dir, device)
         model.setup_breeze_decode(depth_decoder=hf.depth_decoder,
                                   max_batch_size=int(server_args.max_running_requests), device=device)
-        del hf.text_encoder, hf.codec_model                    # the stages own their own copies
+        del hf.codec_model                                     # the vocoder decodes through the audio tokenizer
+        model.hf_prompt_model = hf                             # text encoder + merge: prompts are embedded at prefill
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         mod = importlib.import_module("sglang_omni.models.breeze_tts.model_runner")
